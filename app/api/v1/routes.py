@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
+from app.core.config import get_settings
 
 router = APIRouter()
 
@@ -7,20 +8,17 @@ def health():
     return {"status": "ok"}
 
 @router.get("/env", tags=["meta"])
-def env(openai_api_key: str | None = None,
-        stripe_secret_key: str | None = None,
-        google_client_id: str | None = None,
-        google_client_secret: str | None = None):
+def env():
+    s = get_settings()
     vals = {
-        "OPENAI_API_KEY": openai_api_key,
-        "STRIPE_SECRET_KEY": stripe_secret_key,
-        "GOOGLE_CLIENT_ID": google_client_id,
-        "GOOGLE_CLIENT_SECRET": google_client_secret,
+        "OPENAI_API_KEY": s.openai_api_key,
+        "STRIPE_SECRET_KEY": s.stripe_secret_key,
+        "GOOGLE_CLIENT_ID": s.google_client_id,
+        "GOOGLE_CLIENT_SECRET": s.google_client_secret,
     }
     masked = {k: (None if v is None else f"present(len={len(v)})") for k, v in vals.items()}
     return {"env": masked}
 
 @router.get("/search", tags=["search"])
 def search_placeholder(q: str | None = None):
-    # Placeholder endpoint for v1 search; raises 501 until implemented
-    raise HTTPException(status_code=501, detail="Search API not implemented yet.")
+    return {"detail": "Search API not implemented yet."}
