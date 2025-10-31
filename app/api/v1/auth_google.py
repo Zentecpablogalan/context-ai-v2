@@ -7,7 +7,6 @@ router = APIRouter()
 settings = get_settings()
 oauth = OAuth()
 
-
 oauth.register(
     name="google",
     client_id=settings.google_client_id,
@@ -15,7 +14,6 @@ oauth.register(
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
     client_kwargs={"scope": "openid email profile"},
 )
-
 
 @router.get("/auth/google/login", tags=["auth"])
 async def google_login(request: Request):
@@ -29,4 +27,23 @@ async def google_login(request: Request):
 async def google_callback(request: Request):
     token = await oauth.google.authorize_access_token(request)
     userinfo = token.get("userinfo") or {}
+    # Save minimal profile in session
+    request.session["user"] = {
+        "email": userinfo.get("email"),
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+    }
+    # Return something simple (later we'll redirect to frontend)
     return {"email": userinfo.get("email"), "name": userinfo.get("name")}
+
+@router.get("/auth/me", tags=["auth"])
+async def auth_me(request: Request):
+    user = request.session.get("user")
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+@router.post("/auth/logout", tags=["auth"])
+async def auth_logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
