@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     google_client_id: str | None = None
     google_client_secret: str | None = None
     app_session_secret: Optional[str] = None
+    azure_search_endpoint: str | None = None
+    azure_search_key: str | None = None
 
     # CORS
     cors_origins: str = "*"  # comma-separated if needed
