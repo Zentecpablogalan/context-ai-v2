@@ -37,6 +37,8 @@ def create_app() -> FastAPI:
             stripe_secret_key=s.stripe_secret_key,
             google_client_id=s.google_client_id,
             google_client_secret=s.google_client_secret,
+	    azure_search_endpoint=s.azure_search_endpoint,
+            azure_search_key="present" if s.azure_search_key else None,
         )
 
     # Routers
