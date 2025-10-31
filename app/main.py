@@ -7,7 +7,6 @@ from app.core.logging import setup_logging
 from app.api.v1.routes import router as v1_router
 from app.api.v1.auth_google import router as google_router
 
-
 def create_app() -> FastAPI:
     setup_logging()
     settings = get_settings()
@@ -23,6 +22,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
 
     # Sessions for OAuth (required)
     if not settings.app_session_secret:
@@ -41,7 +41,9 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(v1_router, prefix="/v1", dependencies=[Depends(secret_dep)])
-    app.include_router(google_router, prefix="/v1")# Azure health ping
+    app.include_router(google_router, prefix="/v1")
+
+    # Azure health ping
     @app.get("/health")
     def health():
         return {"status": "ok"}

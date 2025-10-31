@@ -6,6 +6,8 @@ from app.core.config import get_settings
 router = APIRouter()
 settings = get_settings()
 oauth = OAuth()
+
+
 oauth.register(
     name="google",
     client_id=settings.google_client_id,
@@ -13,6 +15,7 @@ oauth.register(
     server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
     client_kwargs={"scope": "openid email profile"},
 )
+
 
 @router.get("/auth/google/login", tags=["auth"])
 async def google_login(request: Request):
