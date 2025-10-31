@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     stripe_secret_key: str | None = None
     google_client_id: str | None = None
     google_client_secret: str | None = None
+    app_session_secret: Optional[str] = None
 
     # CORS
     cors_origins: str = "*"  # comma-separated if needed
