@@ -1,13 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from azure.search.documents.indexes.models import (
     SearchIndex, SimpleField, SearchFieldDataType, SearchableField
 )
 from app.core.search import get_index_client, INDEX_NAME
+from app.api.v1.deps import require_user
 
 router = APIRouter()
 
 @router.post("/search/admin/bootstrap", tags=["search-admin"])
-def search_bootstrap():
+def search_bootstrap(user = Depends(require_user)):
     client = get_index_client()
 
     # If exists, return early
