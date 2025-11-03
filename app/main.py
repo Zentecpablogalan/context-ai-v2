@@ -2,6 +2,9 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.api.v1.search_admin import router as search_admin_router
+from app.api.v1.search_public import router as search_public_router
+from app.api.v1.search_ingest import router as search_ingest_router
 from app.core.config import get_settings
 from app.core.logging import setup_logging
 from app.api.v1.routes import router as v1_router
@@ -44,6 +47,9 @@ def create_app() -> FastAPI:
     # Routers
     app.include_router(v1_router, prefix="/v1", dependencies=[Depends(secret_dep)])
     app.include_router(google_router, prefix="/v1")
+    app.include_router(search_admin_router, prefix="/v1")
+    app.include_router(search_public_router, prefix="/v1")
+    app.include_router(search_ingest_router, prefix="/v1")
 
     # Azure health ping
     @app.get("/health")
