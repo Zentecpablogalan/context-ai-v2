@@ -1,9 +1,9 @@
+import os
+import logging
+import stripe
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-import logging
-import stripe
-import os
 
 from app.api.v1.search_admin import router as search_admin_router
 from app.api.v1.search_public import router as search_public_router
@@ -59,8 +59,8 @@ def create_app() -> FastAPI:
     stripe.api_key = os.getenv("STRIPE_API_KEY", "")
     WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-    @app.post("/v1/billing/webhook", include_in_schema=False)
-    @app.post("/v1/billing/webhook/", include_in_schema=False)
+    @app.post("/v1/billing/webhook", include_in_schema=True)
+    @app.post("/v1/billing/webhook/", include_in_schema=True)
     async def stripe_webhook(request: Request):
         """Handle Stripe webhook events"""
         payload = await request.body()
