@@ -1,6 +1,9 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+import logging
+import stripe
+import os
 
 from app.api.v1.search_admin import router as search_admin_router
 from app.api.v1.search_public import router as search_public_router
@@ -16,6 +19,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(title=settings.app_name)
+    log = logging.getLogger("uvicorn.error")
 
     # CORS
     origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
@@ -51,10 +55,40 @@ def create_app() -> FastAPI:
     app.include_router(search_public_router, prefix="/v1")
     app.include_router(search_ingest_router, prefix="/v1")
 
+    # Stripe webhook configuration
+    stripe.api_key = os.getenv("STRIPE_API_KEY", "")
+    WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+    @app.post("/v1/billing/webhook", include_in_schema=False)
+    @app.post("/v1/billing/webhook/", include_in_schema=False)
+    async def stripe_webhook(request: Request):
+        """Handle Stripe webhook events"""
+        payload = await request.body()
+        sig = request.headers.get("stripe-signature")
+
+        try:
+            event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        except Exception as e:
+            log.exception("Webhook error: %s", e)
+            raise HTTPException(status_code=400, detail="Invalid payload")
+
+        log.info("✅ Stripe event received: %s", event.get("type"))
+        return {"received": True}
+
     # Azure health ping
     @app.get("/health")
     def health():
         return {"status": "ok"}
+
+    # Log all routes at startup for verification
+    @app.on_event("startup")
+    async def log_routes():
+        for route in app.router.routes:
+            methods = getattr(route, "methods", [])
+            path = getattr(route, "path", "")
+            log.info("ROUTE %s %s", ",".join(sorted(methods)), path)
 
     return app
 
