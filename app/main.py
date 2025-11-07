@@ -1,11 +1,17 @@
 import os
+import json
+import base64
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import stripe
 from fastapi import FastAPI, Depends, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+
+from google.cloud import firestore  # type: ignore
+from google.oauth2 import service_account  # type: ignore
+from google.api_core import exceptions as gcloud_exceptions  # type: ignore
 
 from app.api.v1.search_admin import router as search_admin_router
 from app.api.v1.search_public import router as search_public_router
@@ -16,17 +22,100 @@ from app.core.config import get_settings
 from app.core.logging import setup_logging
 
 
+# -----------------------------
+# Firestore client helper
+# -----------------------------
+_firestore_client: Optional[firestore.Client] = None
+
+def get_firestore_client() -> firestore.Client:
+    """
+    Build a Firestore client from FIRESTORE_SA_B64 (base64 of the service account JSON).
+    Falls back to ADC if the var is missing (but we expect it to be present in Azure env).
+    """
+    global _firestore_client
+    if _firestore_client is not None:
+        return _firestore_client
+
+    log = logging.getLogger("uvicorn.error")
+    b64 = os.getenv("FIRESTORE_SA_B64", "")
+    project_id = os.getenv("FIRESTORE_PROJECT_ID")
+
+    if not b64:
+        log.warning("FIRESTORE_SA_B64 is not set; attempting ADC for Firestore")
+        _firestore_client = firestore.Client(project=project_id) if project_id else firestore.Client()
+        return _firestore_client
+
+    try:
+        info = json.loads(base64.b64decode(b64).decode("utf-8"))
+        creds = service_account.Credentials.from_service_account_info(info)
+        if not project_id:
+            project_id = info.get("project_id")
+        if not project_id:
+            raise RuntimeError("No FIRESTORE_PROJECT_ID and no project_id in SA JSON.")
+        _firestore_client = firestore.Client(project=project_id, credentials=creds)
+        log.info("Firestore client initialized for project %s", project_id)
+        return _firestore_client
+    except Exception as e:
+        log.exception("Failed to initialize Firestore client: %s", e)
+        raise
+
+
+def write_customer_subscription_snapshot(
+    customer_id: str,
+    email: Optional[str],
+    subscription_id: Optional[str],
+    status: Optional[str],
+    raw: Dict[str, Any],
+) -> None:
+    """
+    Upsert a customer subscription snapshot into:
+      subscriptions/{customer_id}
+        - email
+        - lastSubscriptionId
+        - lastStatus
+        - updatedAt (server timestamp)
+      subscriptions/{customer_id}/events/{stripe_event_id}
+        - raw event/object for auditing
+    """
+    log = logging.getLogger("uvicorn.error")
+    db = get_firestore_client()
+
+    # document paths
+    cust_ref = db.collection("subscriptions").document(customer_id)
+
+    # We’ll store the 'raw' under events with the Stripe event id if present
+    event_id = raw.get("id") or raw.get("latest_invoice") or "no_event_id"
+    evt_ref = cust_ref.collection("events").document(str(event_id))
+
+    try:
+        db.batch()\
+          .set(cust_ref, {
+              "email": email,
+              "lastSubscriptionId": subscription_id,
+              "lastStatus": status,
+              "updatedAt": firestore.SERVER_TIMESTAMP,
+          }, merge=True)\
+          .set(evt_ref, {"raw": raw, "createdAt": firestore.SERVER_TIMESTAMP}, merge=True)\
+          .commit()
+
+        log.info("🟩 Firestore write OK for customer %s (sub=%s, status=%s)", customer_id, subscription_id, status)
+    except gcloud_exceptions.GoogleAPIError as ge:
+        log.exception("🟥 Firestore API error: %s", ge)
+    except Exception as e:
+        log.exception("🟥 Firestore write unexpected error: %s", e)
+
+
+# -----------------------------
+# App factory
+# -----------------------------
 def create_app() -> FastAPI:
-    """Create and configure FastAPI app."""
     setup_logging()
     settings = get_settings()
 
     app = FastAPI(title=settings.app_name)
     log = logging.getLogger("uvicorn.error")
 
-    # -------------------------------------------------------------------------
-    # CORS Configuration
-    # -------------------------------------------------------------------------
+    # --- CORS ---
     origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
@@ -36,17 +125,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # -------------------------------------------------------------------------
-    # Session Middleware (Google OAuth)
-    # -------------------------------------------------------------------------
+    # --- Session Middleware (for Google OAuth) ---
     if not settings.app_session_secret:
         raise RuntimeError("APP_SESSION_SECRET is not set.")
     app.add_middleware(SessionMiddleware, secret_key=settings.app_session_secret)
 
-    # -------------------------------------------------------------------------
-    # Secrets Dependency
-    # -------------------------------------------------------------------------
-    def secret_dep() -> Dict[str, str | None]:
+    # --- Mask Secrets Dependency ---
+    def secret_dep() -> dict[str, str | None]:
         s = get_settings()
         return {
             "openai_api_key": s.openai_api_key,
@@ -57,9 +142,7 @@ def create_app() -> FastAPI:
             "azure_search_key": "present" if s.azure_search_key else None,
         }
 
-    # -------------------------------------------------------------------------
-    # Include Routers
-    # -------------------------------------------------------------------------
+    # --- Include Routers ---
     app.include_router(v1_router, prefix="/v1", dependencies=[Depends(secret_dep)])
     app.include_router(google_router, prefix="/v1")
     app.include_router(search_admin_router, prefix="/v1")
@@ -67,54 +150,57 @@ def create_app() -> FastAPI:
     app.include_router(search_ingest_router, prefix="/v1")
 
     # -------------------------------------------------------------------------
-    # Stripe Webhook — Handle Subscription Lifecycle
+    # Stripe Webhook — with Firestore integration
     # -------------------------------------------------------------------------
     stripe.api_key = os.getenv("STRIPE_API_KEY", "")
     WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-    seen_events = set()  # simple in-memory idempotency guard
+    seen_events: set[str] = set()  # simple in-memory idempotency
 
-    # Temporary user "database" simulation
-    user_subscriptions: Dict[str, Dict[str, str]] = {}
-
-    async def activate_user(data: Dict[str, Any]) -> None:
-        """Activate user when checkout completes"""
+    async def handle_checkout_completed(data: Dict[str, Any], full_event: Dict[str, Any]) -> None:
         email = (data.get("customer_details") or {}).get("email")
-        sub_id = data.get("subscription")
-        if not email:
-            log.warning("⚠️ No email found in Stripe data")
-            return
-        user_subscriptions[email] = {"status": "active", "subscription_id": sub_id}
-        log.info(f"✅ Activated subscription for {email} ({sub_id})")
+        customer_id = data.get("customer")
+        subscription_id = data.get("subscription")
+        status = (data.get("status") or "").lower()  # often "complete"
+        log.info("✅ Checkout completed: email=%s, customer=%s, sub=%s", email, customer_id, subscription_id)
 
-    async def update_subscription_status(data: Dict[str, Any]) -> None:
-        """Update subscription status"""
-        sub_id = data.get("id")
+        if customer_id:
+            write_customer_subscription_snapshot(
+                customer_id=customer_id,
+                email=email,
+                subscription_id=subscription_id,
+                status=status,
+                raw=full_event,
+            )
+
+    async def handle_subscription_updated(data: Dict[str, Any], full_event: Dict[str, Any]) -> None:
+        # subscription object shape
+        customer_id = data.get("customer")
+        subscription_id = data.get("id")
         status = data.get("status")
-        for email, info in user_subscriptions.items():
-            if info.get("subscription_id") == sub_id:
-                user_subscriptions[email]["status"] = status
-                log.info(f"🔄 Updated {email} → {status}")
-                return
-        log.warning(f"Subscription {sub_id} not found in store")
+        log.info("🔄 Subscription update: customer=%s, sub=%s, status=%s", customer_id, subscription_id, status)
 
-    async def suspend_user(data: Dict[str, Any]) -> None:
-        """Suspend user after failed payment"""
-        sub_id = data.get("subscription") or data.get("customer")
-        for email, info in user_subscriptions.items():
-            if info.get("subscription_id") == sub_id:
-                user_subscriptions[email]["status"] = "suspended"
-                log.warning(f"🚫 Suspended {email} due to failed payment")
-                return
-        log.warning(f"Failed payment: subscription {sub_id} not found")
+        # Try to grab email if present via default_payment_method.billing_details.email
+        email = None
+        if isinstance(data.get("default_payment_method"), dict):
+            pm = data["default_payment_method"]
+            email = (pm.get("billing_details") or {}).get("email")
 
-    # Map event types to handler functions
+        if customer_id:
+            write_customer_subscription_snapshot(
+                customer_id=customer_id,
+                email=email,
+                subscription_id=subscription_id,
+                status=status,
+                raw=full_event,
+            )
+
     def route_event(event_type: str):
         return {
-            "checkout.session.completed": activate_user,
-            "customer.subscription.created": update_subscription_status,
-            "customer.subscription.updated": update_subscription_status,
-            "invoice.payment_succeeded": update_subscription_status,
-            "invoice.payment_failed": suspend_user,
+            "checkout.session.completed": handle_checkout_completed,
+            "customer.subscription.updated": handle_subscription_updated,
+            "customer.subscription.created": handle_subscription_updated,
+            "invoice.payment_succeeded": handle_subscription_updated,
+            "invoice.payment_failed": handle_subscription_updated,
         }.get(event_type)
 
     @app.post("/v1/billing/webhook", include_in_schema=True)
@@ -142,31 +228,27 @@ def create_app() -> FastAPI:
         event_type = event.get("type")
         data = (event.get("data") or {}).get("object") or {}
 
+        # Idempotency check
         if event_id in seen_events:
-            log.info(f"🔁 Duplicate Stripe event ignored: {event_id}")
+            log.info("🔁 Duplicate Stripe event ignored: %s", event_id)
             return {"received": True, "duplicate": True}
         seen_events.add(event_id)
 
-        log.info(f"🎯 Stripe event received: {event_type}")
-
+        log.info("🎯 Stripe event received: %s", event_type)
         handler = route_event(event_type)
         if handler:
-            background.add_task(handler, data)
+            background.add_task(handler, data, event)
         else:
-            log.info(f"No handler for event type {event_type}")
+            log.info("No handler for event type %s", event_type)
 
         return {"received": True}
 
-    # -------------------------------------------------------------------------
-    # Health Check Endpoint
-    # -------------------------------------------------------------------------
+    # Health
     @app.get("/health")
     def health():
         return {"status": "ok"}
 
-    # -------------------------------------------------------------------------
-    # Route Logging on Startup
-    # -------------------------------------------------------------------------
+    # Route log on startup (nice for sanity)
     @app.on_event("startup")
     async def log_routes():
         for route in app.router.routes:
