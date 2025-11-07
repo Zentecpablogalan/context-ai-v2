@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from typing import Any, Dict
 
@@ -18,13 +17,16 @@ from app.core.logging import setup_logging
 
 
 def create_app() -> FastAPI:
+    """Create and configure FastAPI app."""
     setup_logging()
     settings = get_settings()
 
     app = FastAPI(title=settings.app_name)
     log = logging.getLogger("uvicorn.error")
 
-    # --- CORS Configuration ---
+    # -------------------------------------------------------------------------
+    # CORS Configuration
+    # -------------------------------------------------------------------------
     origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
@@ -34,13 +36,17 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # --- Session Middleware (for Google OAuth) ---
+    # -------------------------------------------------------------------------
+    # Session Middleware (Google OAuth)
+    # -------------------------------------------------------------------------
     if not settings.app_session_secret:
         raise RuntimeError("APP_SESSION_SECRET is not set.")
     app.add_middleware(SessionMiddleware, secret_key=settings.app_session_secret)
 
-    # --- Mask Secrets Dependency ---
-    def secret_dep() -> dict[str, str | None]:
+    # -------------------------------------------------------------------------
+    # Secrets Dependency
+    # -------------------------------------------------------------------------
+    def secret_dep() -> Dict[str, str | None]:
         s = get_settings()
         return {
             "openai_api_key": s.openai_api_key,
@@ -51,7 +57,9 @@ def create_app() -> FastAPI:
             "azure_search_key": "present" if s.azure_search_key else None,
         }
 
-    # --- Include Routers ---
+    # -------------------------------------------------------------------------
+    # Include Routers
+    # -------------------------------------------------------------------------
     app.include_router(v1_router, prefix="/v1", dependencies=[Depends(secret_dep)])
     app.include_router(google_router, prefix="/v1")
     app.include_router(search_admin_router, prefix="/v1")
@@ -59,36 +67,54 @@ def create_app() -> FastAPI:
     app.include_router(search_ingest_router, prefix="/v1")
 
     # -------------------------------------------------------------------------
-    # Stripe Webhook — Robust, Production-Ready Implementation
+    # Stripe Webhook — Handle Subscription Lifecycle
     # -------------------------------------------------------------------------
     stripe.api_key = os.getenv("STRIPE_API_KEY", "")
     WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     seen_events = set()  # simple in-memory idempotency guard
 
-    async def handle_checkout_completed(data: Dict[str, Any]) -> None:
-        """Handle successful checkout sessions"""
-        customer_id = data.get("customer")
-        subscription_id = data.get("subscription")
-        email = (data.get("customer_details") or {}).get("email")
-        log.info(f"✅ Checkout completed: email={email}, customer={customer_id}, sub={subscription_id}")
-        # TODO: activate subscription in your DB
+    # Temporary user "database" simulation
+    user_subscriptions: Dict[str, Dict[str, str]] = {}
 
-    async def handle_subscription_updated(data: Dict[str, Any]) -> None:
-        """Handle subscription updates (renewal, cancellation, etc.)"""
+    async def activate_user(data: Dict[str, Any]) -> None:
+        """Activate user when checkout completes"""
+        email = (data.get("customer_details") or {}).get("email")
+        sub_id = data.get("subscription")
+        if not email:
+            log.warning("⚠️ No email found in Stripe data")
+            return
+        user_subscriptions[email] = {"status": "active", "subscription_id": sub_id}
+        log.info(f"✅ Activated subscription for {email} ({sub_id})")
+
+    async def update_subscription_status(data: Dict[str, Any]) -> None:
+        """Update subscription status"""
         sub_id = data.get("id")
         status = data.get("status")
-        customer = data.get("customer")
-        log.info(f"🔄 Subscription updated: sub={sub_id}, status={status}, customer={customer}")
-        # TODO: update subscription in your DB
+        for email, info in user_subscriptions.items():
+            if info.get("subscription_id") == sub_id:
+                user_subscriptions[email]["status"] = status
+                log.info(f"🔄 Updated {email} → {status}")
+                return
+        log.warning(f"Subscription {sub_id} not found in store")
 
+    async def suspend_user(data: Dict[str, Any]) -> None:
+        """Suspend user after failed payment"""
+        sub_id = data.get("subscription") or data.get("customer")
+        for email, info in user_subscriptions.items():
+            if info.get("subscription_id") == sub_id:
+                user_subscriptions[email]["status"] = "suspended"
+                log.warning(f"🚫 Suspended {email} due to failed payment")
+                return
+        log.warning(f"Failed payment: subscription {sub_id} not found")
+
+    # Map event types to handler functions
     def route_event(event_type: str):
-        """Map Stripe event type → handler"""
         return {
-            "checkout.session.completed": handle_checkout_completed,
-            "customer.subscription.updated": handle_subscription_updated,
-            "customer.subscription.created": handle_subscription_updated,
-            "invoice.payment_succeeded": handle_subscription_updated,
-            "invoice.payment_failed": handle_subscription_updated,
+            "checkout.session.completed": activate_user,
+            "customer.subscription.created": update_subscription_status,
+            "customer.subscription.updated": update_subscription_status,
+            "invoice.payment_succeeded": update_subscription_status,
+            "invoice.payment_failed": suspend_user,
         }.get(event_type)
 
     @app.post("/v1/billing/webhook", include_in_schema=True)
@@ -101,7 +127,6 @@ def create_app() -> FastAPI:
 
         payload = await request.body()
         sig = request.headers.get("stripe-signature")
-
         if not sig:
             raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
 
@@ -117,7 +142,6 @@ def create_app() -> FastAPI:
         event_type = event.get("type")
         data = (event.get("data") or {}).get("object") or {}
 
-        # Idempotency check
         if event_id in seen_events:
             log.info(f"🔁 Duplicate Stripe event ignored: {event_id}")
             return {"received": True, "duplicate": True}
